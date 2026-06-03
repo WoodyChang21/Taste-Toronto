@@ -1,0 +1,70 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+:root {
+  color-scheme: light;
+  --cream: #EFEFEB;
+  --cream-dark: #E8E8E3;
+  --ink: #1A1A1A;
+  --ink-light: #555;
+  --ink-muted: #999;
+  --ink-faint: #bbb;
+  --pill-bg: #2C2C2C;
+  --pill-text: #F5F5F0;
+  --border: #D8D8D2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  background: var(--cream);
+  color: var(--ink);
+  font-family: var(--font-dm-sans), sans-serif;
+  font-weight: 300;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Message fade-in */
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.msg-enter {
+  animation: msgIn 0.35s ease forwards;
+}
+
+/* Dot pulse for typing indicator */
+@keyframes dotPulse {
+  0%, 60%, 100% { opacity: 0.15; transform: translateY(0); }
+  30%           { opacity: 0.7;  transform: translateY(-3px); }
+}
+
+.dot-pulse span {
+  display: inline-block;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--ink-muted);
+  animation: dotPulse 1.2s ease-in-out infinite;
+}
+.dot-pulse span:nth-child(2) { animation-delay: 0.18s; }
+.dot-pulse span:nth-child(3) { animation-delay: 0.36s; }
+
+/* Placeholder cycling */
+@keyframes placeholderFade {
+  0%, 18%   { opacity: 1; }
+  25%, 92%  { opacity: 0; }
+  100%      { opacity: 0; }
+}
+
+/* Input placeholder */
+::placeholder { color: var(--ink-muted); opacity: 1; }
+textarea::placeholder { color: var(--ink-muted); opacity: 1; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
