@@ -23,32 +23,32 @@ flowchart TD
     TC -->|reaction| RR[Reaction Responder]
     TC -->|chitchat| CR[Chitchat Responder]
 
-    IE -->|needs_followup| FU[Followup Interrupt\nasks one question]
+    IE -->|needs followup| FU[Followup Interrupt]
     IE -->|complete| RET[Restaurant Retriever]
     FU -->|user answers| IE
 
     IM --> RET
 
-    RET --> SA[Scoring Agent\nLLM reranker]
+    RET --> SA[Scoring Agent]
     SA --> RG[Response Generator]
-    RG --> END([Streamed response\n+ restaurant cards])
+    RG --> DONE([Streamed Response and Cards])
 
-    RR -->|pivot: user wants different results| IM
-    RR -->|comment: just reacting| END
+    RR -->|pivot| IM
+    RR -->|comment| DONE
 
-    CR --> END
+    CR --> DONE
 ```
 
 ### Retriever subgraph (parallel fan-out)
 
 ```mermaid
 flowchart LR
-    IN([Intent]) --> FO{Fan-out\nvia Send}
-    FO -->|always| VS[Vector Search\nChromaDB embeddings]
-    FO -->|if cuisine or budget| MF[Metadata Filter\nChromaDB exact match]
-    VS --> MG[Merge & Dedupe\nbest distance wins]
+    IN([Intent]) --> FO{Fan-out via Send}
+    FO -->|always| VS[Vector Search]
+    FO -->|if cuisine or budget| MF[Metadata Filter]
+    VS --> MG[Merge and Dedupe]
     MF --> MG
-    MG --> OUT([Top 20 candidates])
+    MG --> OUT([Top 20 Candidates])
 ```
 
 ### Pipeline summary
