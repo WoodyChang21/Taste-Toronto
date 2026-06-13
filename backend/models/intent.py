@@ -10,6 +10,9 @@ class Intent(BaseModel):
     neighborhood: str | None = None
     vibe: list[str] = []
     cuisine: list[str] = []
+    dietary: list[str] = []       # e.g. ["vegetarian", "vegan", "halal", "gluten_free"]
+    meal_type: str | None = None  # "lunch" | "dinner" | "brunch" | "late_night"
+    amenities: list[str] = []     # e.g. ["patio", "parking", "live_music", "reservable"]
     is_complete: bool = False
     needs_followup: bool = True
     followup_question: str | None = None

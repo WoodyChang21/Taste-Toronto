@@ -421,11 +421,12 @@ def fetch_and_seed(max_per_query: int = 10, total_cap: int = 200) -> None:
             restaurant_repo.upsert(record)
 
             try:
-                embedding = get_embedding(record.description)
+                from backend.data.reembed import build_embed_text
+                embedding = get_embedding(build_embed_text(record))
                 collection.upsert(
                     ids=[record.id],
                     embeddings=[embedding],
-                    documents=[record.description],
+                    documents=[build_embed_text(record)],
                     metadatas=[{
                         "name": record.name,
                         "neighborhood": record.neighborhood,

@@ -4,12 +4,14 @@ from dotenv import load_dotenv
 # Load .env from workspace root (two levels up from backend/)
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+import json
 import os
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from langgraph.types import Command
 
 from .db.models import init_db
 from .db import restaurant_repo
@@ -17,22 +19,30 @@ from .graph import taste_graph
 from .models.chat import ChatRequest, ChatResponse
 from .models.intent import Intent
 from .models.restaurant import RestaurantRecord
-from .conversation import memory
 
 PLACES_BASE = "https://places.googleapis.com/v1"
 
-# Toronto bounding box for autocomplete location bias
 TORONTO_CIRCLE = {
     "circle": {
         "center": {"latitude": 43.6532, "longitude": -79.3832},
-        "radius": 50000.0,  # 50km covers the full GTA
+        "radius": 50000.0,
     }
 }
+
+# Sessions flagged for reset — cleared on next chat invocation
+_cleared_sessions: set[str] = set()
 
 
 class AutocompleteRequest(BaseModel):
     input: str
     session_token: str
+
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+    restaurant_id: str
+    signal: str  # "like" | "dislike"
+
 
 app = FastAPI(title="Taste Toronto API")
 
@@ -57,55 +67,159 @@ def health():
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     try:
-        history = memory.get_history(req.session_id)
-        initial_state = {
-            "session_id": req.session_id,
-            "user_message": req.message,
-            "history": history,
-            "intent": None,
-            "candidates": [],
-            "scored": [],
-            "response": "",
-            "needs_followup": False,
-        }
+        config = {"configurable": {"thread_id": req.session_id}}
 
-        result = taste_graph.invoke(initial_state)
+        is_reset = req.session_id in _cleared_sessions
+        if is_reset:
+            _cleared_sessions.discard(req.session_id)
+
+        current_state = taste_graph.get_state(config)
+
+        if not is_reset and current_state.next:
+            # Graph is paused at a follow-up interrupt — resume with user's answer
+            result = await taste_graph.ainvoke(Command(resume=req.message), config)
+        else:
+            # New turn (or first message after reset)
+            input_state: dict = {
+                "user_message": req.message,
+                "candidates": [],
+                "scored": [],
+                "response": "",
+                "turn_type": None,
+            }
+            if is_reset:
+                input_state["intent"] = None
+                input_state["shown_restaurant_ids"] = []
+                input_state["user_feedback"] = {"liked": [], "disliked": []}
+            result = await taste_graph.ainvoke(input_state, config)
+
+        # Graph hit a follow-up interrupt this turn
+        if result.get("__interrupt__"):
+            question = result["__interrupt__"][0].value.get(
+                "question", "Could you tell me a bit more?"
+            )
+            return ChatResponse(
+                session_id=req.session_id,
+                message=question,
+                restaurants=[],
+                needs_followup=True,
+            )
 
         intent_data = result.get("intent") or {}
         intent = Intent(**intent_data) if intent_data else None
-
-        needs_followup = result.get("needs_followup", False)
-
-        if needs_followup:
-            response_text = intent_data.get("followup_question") or "Could you tell me a bit more?"
-        else:
-            response_text = result.get("response", "")
-
         scored_raw = result.get("scored") or []
         restaurants = [RestaurantRecord(**r) for r in scored_raw]
 
-        memory.append(req.session_id, "user", req.message)
-        memory.append(req.session_id, "assistant", response_text)
-
         return ChatResponse(
             session_id=req.session_id,
-            message=response_text,
+            message=result.get("response", ""),
             restaurants=restaurants,
             intent=intent,
-            needs_followup=needs_followup,
+            needs_followup=False,
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    config = {"configurable": {"thread_id": req.session_id}}
+    is_reset = req.session_id in _cleared_sessions
+    if is_reset:
+        _cleared_sessions.discard(req.session_id)
+
+    current_state = taste_graph.get_state(config)
+
+    if not is_reset and current_state.next:
+        input_data = Command(resume=req.message)
+    else:
+        input_data = {
+            "user_message": req.message,
+            "candidates": [],
+            "scored": [],
+            "response": "",
+            "turn_type": None,
+        }
+        if is_reset:
+            input_data["intent"] = None
+            input_data["shown_restaurant_ids"] = []
+            input_data["user_feedback"] = {"liked": [], "disliked": []}
+
+    async def generate():
+        try:
+            text_streamed = False
+            async for event in taste_graph.astream_events(input_data, config, version="v2"):
+                event_name = event.get("event", "")
+                node_name = event.get("metadata", {}).get("langgraph_node", "")
+
+                if event_name == "on_chat_model_stream" and node_name in (
+                    "response_generator", "chitchat_responder"
+                ):
+                    chunk = event["data"]["chunk"].content
+                    if chunk:
+                        text_streamed = True
+                        yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+
+            # Inspect final graph state to detect interrupt or emit results
+            final_state = taste_graph.get_state(config)
+
+            if final_state.next:
+                # Graph paused at a followup interrupt
+                for task in final_state.tasks:
+                    if task.interrupts:
+                        question = task.interrupts[0].value.get(
+                            "question", "Could you tell me a bit more?"
+                        )
+                        yield f"data: {json.dumps({'type': 'followup', 'question': question})}\n\n"
+                        break
+            else:
+                # Graph completed — emit stored response if not already streamed (e.g. chitchat)
+                if not text_streamed:
+                    response = final_state.values.get("response", "")
+                    if response:
+                        yield f"data: {json.dumps({'type': 'text', 'content': response})}\n\n"
+
+                scored = final_state.values.get("scored") or []
+                if scored:
+                    yield f"data: {json.dumps({'type': 'restaurants', 'restaurants': scored})}\n\n"
+
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/feedback")
+async def feedback(req: FeedbackRequest):
+    config = {"configurable": {"thread_id": req.session_id}}
+    try:
+        current = taste_graph.get_state(config)
+        feedback_state = (current.values.get("user_feedback") or {})
+        liked = list(feedback_state.get("liked", []))
+        disliked = list(feedback_state.get("disliked", []))
+
+        if req.signal == "like" and req.restaurant_id not in liked:
+            liked.append(req.restaurant_id)
+            disliked = [r for r in disliked if r != req.restaurant_id]
+        elif req.signal == "dislike" and req.restaurant_id not in disliked:
+            disliked.append(req.restaurant_id)
+            liked = [r for r in liked if r != req.restaurant_id]
+
+        taste_graph.update_state(config, {"user_feedback": {"liked": liked, "disliked": disliked}})
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/autocomplete")
 async def autocomplete(req: AutocompleteRequest):
-    """
-    Proxies Google Places Autocomplete (New) with Toronto location bias.
-    Uses session tokens so all keystrokes in one search = 1 billing session.
-    Returns up to 5 place suggestions (restaurants + neighborhoods).
-    """
     api_key = os.getenv("GOOGLE_PLACES_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=500, detail="GOOGLE_PLACES_API_KEY not configured")
@@ -168,7 +282,6 @@ async def get_photo(restaurant_id: str):
     photo_name = restaurant_repo.get_photo_name(restaurant_id)
     if not photo_name:
         raise HTTPException(status_code=404, detail="No photo available")
-    # skipHttpRedirect=true returns JSON with photoUri; follow_redirects fetches the image directly
     url = f"{PLACES_BASE}/{photo_name}/media?maxWidthPx=600"
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
@@ -187,5 +300,5 @@ async def get_photo(restaurant_id: str):
 
 @app.delete("/api/session/{session_id}")
 def clear_session(session_id: str):
-    memory.clear(session_id)
+    _cleared_sessions.add(session_id)
     return {"ok": True}

@@ -1,88 +1,104 @@
+from pydantic import BaseModel
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 import json
-from ..services.openai_client import chat_completion
+
 from ..models.restaurant import RestaurantRecord, ScoredRestaurant
 
-SCORING_SYSTEM = """You are a restaurant scoring engine for Toronto. Score each restaurant 0–100 based on how well it fits the user's specific request.
+_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-Scoring signals (apply all that are relevant):
-- Cuisine match: if the user specified a cuisine, treat it as a strong preference. A non-matching cuisine should lose 40–50 points — a Japanese restaurant should not beat a Korean restaurant when the user asked for Korean, even if the Japanese restaurant has better occasion scores
-- Occasion/vibe fit: use the pre-computed occasion_scores (date_night, birthday, family_gathering, hidden_gem) as a meaningful signal — these are 0–100 and reflect restaurant character
-- Budget fit: restaurants outside the user's budget range lose 20–30 points
-- Group size fit: if the user has a large group and the restaurant is intimate/small, reduce score
-- Neighborhood match: if the user specified a neighborhood, boost nearby restaurants
-- Hidden gem: if the user wants something undiscovered — fewer reviews + high rating = higher score
 
-Respond with valid JSON only — an array:
-[{"id": "...", "score": 0-100, "reasoning": "one sentence max"}]
+class _RankedResult(BaseModel):
+    id: str
+    rank: int
+    reasoning: str  # 1-2 sentences shown on the card
+
+
+class _RerankerOutput(BaseModel):
+    results: list[_RankedResult]
+
+
+_structured_llm = _llm.with_structured_output(_RerankerOutput)
+
+RERANKER_SYSTEM = """You are a Toronto restaurant expert ranking candidates for a user's specific request.
+
+Given the user's intent and a list of candidate restaurants, select and rank the TOP 5 best matches.
+Return exactly 5 results (or fewer if fewer candidates exist).
+
+Rules:
+- Rank by overall fit: occasion, budget, cuisine, neighborhood, noise level, group size, dietary needs, amenities
+- If dietary restrictions are specified (vegetarian, vegan, halal, gluten_free), EXCLUDE restaurants that don't support them unless semantic_tags explicitly include the restriction
+- If shown_restaurant_ids is non-empty, down-rank those restaurants unless no better options exist
+- If liked_ids is non-empty, favor restaurants with similar cuisine/vibe/neighborhood
+- If disliked_ids is non-empty, avoid restaurants with similar characteristics
+- reasoning must be 1-2 sentences: specific, warm, and reference WHY this place fits THIS request
+- Never use generic phrases like "great choice" — always name a concrete detail (dish, atmosphere, feature)
 """
 
 
 def scoring_node(state: dict) -> dict:
-    intent = state["intent"]
+    intent = state.get("intent") or {}
     candidates_data = state.get("candidates", [])
 
     if not candidates_data:
-        return {**state, "scored": []}
+        return {"scored": []}
+
+    feedback = state.get("user_feedback") or {}
+    shown_ids = state.get("shown_restaurant_ids") or []
+    liked_ids = feedback.get("liked", [])
+    disliked_ids = feedback.get("disliked", [])
 
     candidates = [RestaurantRecord(**r) for r in candidates_data]
-    scored = score_restaurants(candidates, intent)
-    return {**state, "scored": [r.model_dump() for r in scored]}
 
-
-def score_restaurants(
-    candidates: list[RestaurantRecord], intent: dict
-) -> list[ScoredRestaurant]:
-    summary = [
-        {
+    candidate_summaries = []
+    for r in candidates:
+        candidate_summaries.append({
             "id": r.id,
             "name": r.name,
             "cuisine": r.cuisine,
             "price_range": r.price_range,
+            "neighborhood": r.neighborhood,
+            "noise_level": r.noise_level,
             "rating": r.rating,
             "review_count": r.review_count,
-            "noise_level": r.noise_level,
-            "parking": r.parking,
             "semantic_tags": r.semantic_tags,
-            "occasion_scores": r.occasion_scores,
-        }
-        for r in candidates
-    ]
+            "description": r.description,
+        })
 
-    occasion_desc = intent.get("occasion") or "general dining"
-    prompt = (
-        f"User request: {occasion_desc}\n"
-        f"Group size: {intent.get('group_size')}\n"
-        f"Budget: {intent.get('budget')}\n"
-        f"Vibe preferences: {intent.get('vibe')}\n"
-        f"Cuisine preferences: {intent.get('cuisine')}\n"
-        f"Neighborhood: {intent.get('neighborhood')}\n\n"
-        f"Restaurants:\n{json.dumps(summary, indent=2)}"
-    )
+    user_prompt = json.dumps({
+        "intent": {
+            "occasion": intent.get("occasion"),
+            "group_size": intent.get("group_size"),
+            "budget": intent.get("budget"),
+            "neighborhood": intent.get("neighborhood"),
+            "vibe": intent.get("vibe") or [],
+            "cuisine": intent.get("cuisine") or [],
+            "dietary": intent.get("dietary") or [],
+            "meal_type": intent.get("meal_type"),
+            "amenities": intent.get("amenities") or [],
+        },
+        "shown_restaurant_ids": shown_ids,
+        "liked_ids": liked_ids,
+        "disliked_ids": disliked_ids,
+        "candidates": candidate_summaries,
+    }, ensure_ascii=False, indent=2)
 
-    raw = chat_completion(
-        SCORING_SYSTEM,
-        [{"role": "user", "content": prompt}],
-        json_mode=True,
-        max_tokens=2048,
-    )
-    scores_data = json.loads(raw)
+    output: _RerankerOutput = _structured_llm.invoke([
+        SystemMessage(content=RERANKER_SYSTEM),
+        HumanMessage(content=user_prompt),
+    ])
 
-    if isinstance(scores_data, dict):
-        scores_list = next(iter(scores_data.values()))
-    else:
-        scores_list = scores_data
-
-    score_map = {s["id"]: s for s in scores_list}
+    ranked_ids = {r.id: r for r in output.results}
     scored: list[ScoredRestaurant] = []
     for r in candidates:
-        entry = score_map.get(r.id)
-        if entry:
-            scored.append(
-                ScoredRestaurant(
-                    **r.model_dump(),
-                    final_score=entry["score"],
-                    score_reasoning=entry.get("reasoning", ""),
-                )
-            )
+        ranked = ranked_ids.get(r.id)
+        if ranked is None:
+            continue
+        scored.append(ScoredRestaurant(
+            **r.model_dump(),
+            final_score=max(0, 100 - (ranked.rank - 1) * 15),
+            score_reasoning=ranked.reasoning,
+        ))
 
-    return sorted(scored, key=lambda x: x.final_score, reverse=True)[:5]
+    scored.sort(key=lambda x: x.final_score, reverse=True)
+    return {"scored": [r.model_dump() for r in scored[:5]]}

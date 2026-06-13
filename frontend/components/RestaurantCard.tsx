@@ -103,6 +103,22 @@ export default function RestaurantListItem({
             </p>
           )}
 
+          {r.score_reasoning && (
+            <p
+              style={{
+                fontSize: "0.78rem",
+                color: "var(--ink-muted)",
+                fontStyle: "italic",
+                lineHeight: 1.6,
+                borderLeft: "2px solid var(--border)",
+                paddingLeft: "0.6rem",
+                margin: "0 0 0.5rem",
+              }}
+            >
+              ✦ {r.score_reasoning}
+            </p>
+          )}
+
           <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap" }}>
             {reserveHref && (
               <a

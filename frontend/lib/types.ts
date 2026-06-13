@@ -31,6 +31,7 @@ export interface ScoredRestaurant {
   latitude: number | null;
   longitude: number | null;
   google_maps_url: string | null;
+  score_reasoning: string;
 }
 
 export interface ChatResponse {
@@ -46,4 +47,10 @@ export interface UIMessage {
   content: string;
   restaurants?: ScoredRestaurant[];
   needs_followup?: boolean;
+}
+
+export interface FeedbackRequest {
+  session_id: string;
+  restaurant_id: string;
+  signal: "like" | "dislike";
 }

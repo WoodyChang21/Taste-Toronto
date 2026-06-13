@@ -1,27 +1,53 @@
+from typing import Annotated
+import operator
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+from typing_extensions import TypedDict
+
 from ..db.chroma_client import get_collection
 from ..db import restaurant_repo
 from ..services.openai_client import get_embedding
 
-DISTANCE_THRESHOLD = 0.75
-MIN_RESULTS = 3
-MAX_RESULTS = 10
+MAX_VECTOR_RESULTS = 20
+MAX_CANDIDATES = 20
 
 
-def retriever_node(state: dict) -> dict:
-    intent = state["intent"]
-    candidates = retrieve_candidates(intent)
-    return {**state, "candidates": [r.model_dump() for r in candidates]}
+# ── Retrieval subgraph state ──────────────────────────────────────────────────
+
+class _RetrieverState(TypedDict):
+    intent: dict
+    # Accumulated (id, distance) pairs from parallel workers — reducer required
+    raw_results: Annotated[list[tuple[str, float]], operator.add]
 
 
-def retrieve_candidates(intent: dict) -> list:
+# ── Worker node ───────────────────────────────────────────────────────────────
+
+def _retrieval_worker(state: dict) -> dict:
+    """Handles both 'vector' and 'metadata' branches depending on state['branch']."""
+    intent: dict = state["intent"]
+    branch: str = state["branch"]
+
+    if branch == "vector":
+        return {"raw_results": _vector_search(intent)}
+    else:
+        return {"raw_results": _metadata_filter(intent)}
+
+
+def _vector_search(intent: dict) -> list[tuple[str, float]]:
     query_parts: list[str] = []
-    occasion = intent.get("occasion")
-    if occasion:
-        query_parts.append(occasion)
+    if intent.get("occasion"):
+        query_parts.append(intent["occasion"])
     for cuisine in intent.get("cuisine") or []:
         query_parts.append(cuisine)
     for vibe in intent.get("vibe") or []:
         query_parts.append(vibe)
+    for dietary in intent.get("dietary") or []:
+        query_parts.append(dietary)
+    for amenity in intent.get("amenities") or []:
+        query_parts.append(amenity)
+    if intent.get("meal_type"):
+        query_parts.append(intent["meal_type"])
     if intent.get("neighborhood"):
         query_parts.append(intent["neighborhood"])
     if intent.get("budget"):
@@ -33,52 +59,95 @@ def retrieve_candidates(intent: dict) -> list:
     embedding = get_embedding(" ".join(query_parts))
     collection = get_collection()
     total = collection.count() or 1
-    n_fetch = min(MAX_RESULTS * 2, total)
+    n_fetch = min(MAX_VECTOR_RESULTS, total)
 
-    # Vector search — no where filter (ChromaDB where in query() is unreliable)
     results = collection.query(
         query_embeddings=[embedding],
         n_results=n_fetch,
-        include=["metadatas", "distances"],
+        include=["distances"],
     )
     ids = results["ids"][0] if results["ids"] else []
     distances = results["distances"][0] if results["distances"] else []
-    dist_map = dict(zip(ids, distances))
+    return list(zip(ids, distances))
 
-    # If cuisine is specified, fetch all cuisine-matching IDs via get()
-    # collection.query() where filter is unreliable; collection.get() works correctly
+
+def _metadata_filter(intent: dict) -> list[tuple[str, float]]:
+    """Exact metadata filter for cuisine and/or price_range."""
+    collection = get_collection()
+    filters: list[dict] = []
+
     cuisines = intent.get("cuisine") or []
-    cuisine_set: set[str] = set()
     if cuisines:
         cuisine_val = cuisines[0].capitalize()
-        try:
-            cuisine_docs = collection.get(
-                where={"cuisine": {"$eq": cuisine_val}},
-                limit=999,
-            )
-            cuisine_set = set(cuisine_docs["ids"])
-            # Merge cuisine IDs not already in vector results
-            worst = max(dist_map.values(), default=0.5)
-            for cid in cuisine_set:
-                if cid not in dist_map:
-                    dist_map[cid] = worst + 0.01
-        except Exception:
-            pass
+        filters.append({"cuisine": {"$eq": cuisine_val}})
 
-    # Sort all candidates by distance (best first)
-    ordered = sorted(dist_map.items(), key=lambda x: x[1])
+    budget = intent.get("budget")
+    if budget:
+        filters.append({"price_range": {"$eq": budget}})
 
-    if cuisine_set:
-        # All cuisine matches first so scoring agent sees them; fill rest with best vector matches
-        cuisine_ordered = [id_ for id_, _ in ordered if id_ in cuisine_set]
-        other_ordered = [id_ for id_, _ in ordered if id_ not in cuisine_set]
-        combined = cuisine_ordered + other_ordered[:max(MAX_RESULTS - len(cuisine_ordered), MIN_RESULTS)]
-        return restaurant_repo.get_by_ids(combined)
+    if not filters:
+        return []
 
-    # No cuisine filter: use distance threshold, guarantee MIN_RESULTS
-    filtered_ids = [id_ for id_, d in ordered if d < DISTANCE_THRESHOLD]
-    if len(filtered_ids) < MIN_RESULTS:
-        filtered_ids = [id_ for id_, _ in ordered[:MIN_RESULTS]]
-    filtered_ids = filtered_ids[:MAX_RESULTS]
+    where = filters[0] if len(filters) == 1 else {"$and": filters}
 
-    return restaurant_repo.get_by_ids(filtered_ids)
+    try:
+        docs = collection.get(where=where, limit=999)
+        # Assign a competitive synthetic distance so metadata matches surface
+        return [(cid, 0.25) for cid in (docs["ids"] or [])]
+    except Exception:
+        return []
+
+
+# ── Fan-out node ──────────────────────────────────────────────────────────────
+
+def _fan_out(state: _RetrieverState) -> list:
+    intent = state["intent"]
+    sends = [Send("retrieval_worker", {"intent": intent, "branch": "vector"})]
+
+    has_cuisine = bool(intent.get("cuisine"))
+    has_budget = bool(intent.get("budget"))
+    if has_cuisine or has_budget:
+        sends.append(Send("retrieval_worker", {"intent": intent, "branch": "metadata"}))
+
+    return sends
+
+
+# ── Merge node ────────────────────────────────────────────────────────────────
+
+def _merge_node(state: _RetrieverState) -> dict:
+    # Deduplicate by ID — keep best (lowest) distance per restaurant
+    dist_map: dict[str, float] = {}
+    for rid, dist in state["raw_results"]:
+        if rid not in dist_map or dist < dist_map[rid]:
+            dist_map[rid] = dist
+
+    ordered_ids = [rid for rid, _ in sorted(dist_map.items(), key=lambda x: x[1])]
+    ordered_ids = ordered_ids[:MAX_CANDIDATES]
+
+    restaurants = restaurant_repo.get_by_ids(ordered_ids)
+    return {"candidates": [r.model_dump() for r in restaurants]}
+
+
+# ── Compile retrieval subgraph ────────────────────────────────────────────────
+
+class _SubgraphOutput(TypedDict):
+    candidates: list[dict]
+
+
+_retriever_builder = StateGraph(_RetrieverState, output=_SubgraphOutput)
+_retriever_builder.add_node("retrieval_worker", _retrieval_worker)
+_retriever_builder.add_node("merge", _merge_node)
+_retriever_builder.add_conditional_edges(START, _fan_out, ["retrieval_worker"])
+_retriever_builder.add_edge("retrieval_worker", "merge")
+_retriever_builder.add_edge("merge", END)
+
+_retriever_subgraph = _retriever_builder.compile()
+
+
+# ── Public node (called from main graph) ──────────────────────────────────────
+
+def retriever_node(state: dict) -> dict:
+    result = _retriever_subgraph.invoke(
+        {"intent": state["intent"], "raw_results": []},
+    )
+    return {"candidates": result["candidates"]}
